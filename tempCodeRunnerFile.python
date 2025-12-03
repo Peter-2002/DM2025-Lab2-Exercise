@@ -1,0 +1,252 @@
+import pandas as pd
+import json
+import re
+import numpy as np
+import emoji 
+import nltk
+import sys
+from gensim.models import Word2Vec 
+from sklearn.svm import LinearSVC
+from sklearn.model_selection import train_test_split, GridSearchCV 
+from sklearn.preprocessing import StandardScaler, LabelEncoder
+from nltk.corpus import stopwords
+from nltk.tokenize import word_tokenize
+from nltk.stem import WordNetLemmatizer
+from nltk.sentiment.vader import SentimentIntensityAnalyzer
+from sklearn.metrics import f1_score, classification_report
+from IPython.display import display, HTML # For better visualization
+
+
+# --- 0. Initialization & Setup ---
+print("--- 0. Initialization and Setup ---")
+
+VECTOR_SIZE = 100 
+stop_words = set(stopwords.words('english'))
+lemmatizer = WordNetLemmatizer()
+sia = SentimentIntensityAnalyzer()
+
+SCALER = StandardScaler() 
+ENCODER = LabelEncoder() 
+
+EMOJI_SENTIMENT_MAP = {
+    '😂': 0.8, '😭': -0.7, '😊': 0.9, '❤️': 0.9, '👍': 0.7, 
+    '😔': -0.8, '😠': -0.9, '😡': -0.9, '😢': -0.8, '😁': 0.9,
+    '🤔': 0.1, '😫': -0.6, '🥳': 1.0, '🎉': 0.8, '😐': 0.0,
+    '😨': -0.9, '😱': -0.9, '🤯': 0.7, '🤢': -0.8
+}
+
+# --- Helper Functions (Pre-processing & Feature Engineering) ---
+
+def preprocess_text(text, return_tokens=False):
+    if pd.isna(text) or text is None:
+        if return_tokens: return []
+        return ""
+    text = text.lower()
+    text = emoji.demojize(text, delimiters=(" ", " ")) 
+    text = re.sub(r'@\w+', '', text)
+    text = re.sub(r'http\S+|www\S+', '', text)
+    text = re.sub(r'[^\w\s]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    tokens = word_tokenize(text)
+    lemmas = [lemmatizer.lemmatize(w) for w in tokens if w not in stop_words]
+    return lemmas if return_tokens else " ".join(lemmas)
+
+def average_word_vectors(tokens, model, vector_size):
+    if not tokens: return np.zeros(vector_size)
+    vectors = [model.wv[word] for word in tokens if word in model.wv]
+    if not vectors: return np.zeros(vector_size)
+    return np.mean(vectors, axis=0)
+
+def calculate_emoji_features(raw_text):
+    if pd.isna(raw_text) or raw_text is None: return 0, 0
+    all_emojis = [c for c in raw_text if c in emoji.EMOJI_DATA]
+    count = len(all_emojis)
+    if count == 0: return 0, 0
+    sentiment_sum = sum(EMOJI_SENTIMENT_MAP.get(e, 0) for e in all_emojis)
+    return count, sentiment_sum / count
+
+def calculate_statistical_features(df):
+    df['char_count'] = df['text'].str.len().fillna(0)
+    df['vader_compound'] = df['text'].astype(str).apply(lambda x: sia.polarity_scores(x)['compound'])
+    df[['emoji_count', 'emoji_sentiment']] = df['text'].apply(
+        lambda x: pd.Series(calculate_emoji_features(x))
+    )
+    return df[['char_count', 'vader_compound', 'emoji_count', 'emoji_sentiment']].values
+
+def load_data(file_path, file_type):
+    try:
+        if file_type == 'json':
+            with open(file_path, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            posts_data = [item['root']['_source']['post'] for item in data]
+            return pd.DataFrame(posts_data)
+        elif file_type == 'csv':
+            return pd.read_csv(file_path)
+    except FileNotFoundError:
+        print(f"Error: Required file not found at '{file_path}'. Exiting.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error loading {file_path}: {e}. Exiting.")
+        sys.exit(1)
+    return None
+
+# --- 1. Data Ingestion, Splitting, and Feature Engineering ---
+
+print("\n--- 1. Data Ingestion and Feature Engineering ---")
+
+POSTS_FILE = 'final_posts.json'
+ID_FILE = 'data_identification.csv'
+EMOTION_FILE = 'emotion.csv'
+
+# Load, Merge, and Split
+df_posts = load_data(POSTS_FILE, 'json')
+df_id = load_data(ID_FILE, 'csv')
+df_emotion = load_data(EMOTION_FILE, 'csv')
+
+df_labels = pd.merge(df_id, df_emotion, on='id', how='left')
+df_labels.rename(columns={'id': 'post_id'}, inplace=True)
+df_master = pd.merge(df_posts, df_labels, on='post_id', how='left')
+
+df_train = df_master[df_master['split'] == 'train'].reset_index(drop=True).copy()
+df_test = df_master[df_master['split'] == 'test'].reset_index(drop=True).copy()
+
+df_train.drop(columns=['split', 'hashtags'], inplace=True, errors='ignore')
+df_test.drop(columns=['split', 'emotion', 'hashtags'], inplace=True, errors='ignore')
+
+# Preprocessing (Tokenization)
+df_train['tokens'] = df_train['text'].apply(lambda x: preprocess_text(x, return_tokens=True))
+df_test['tokens'] = df_test['text'].apply(lambda x: preprocess_text(x, return_tokens=True))
+
+# Feature Engineering
+w2v_model = Word2Vec(sentences=df_train['tokens'], vector_size=VECTOR_SIZE, window=5, min_count=5, workers=4)
+X_train_w2v_raw = np.array([average_word_vectors(tokens, w2v_model, VECTOR_SIZE) for tokens in df_train['tokens']])
+X_test_w2v_raw = np.array([average_word_vectors(tokens, w2v_model, VECTOR_SIZE) for tokens in df_test['tokens']])
+
+X_train_stat_raw = calculate_statistical_features(df_train)
+X_test_stat_raw = calculate_statistical_features(df_test)
+
+X_train_stat_scaled = SCALER.fit_transform(X_train_stat_raw) 
+X_test_stat_scaled = SCALER.transform(X_test_stat_raw)
+
+X_train_combined = np.hstack([X_train_w2v_raw, X_train_stat_scaled])
+X_test_combined = np.hstack([X_test_w2v_raw, X_test_stat_scaled])
+
+Y_train_raw = df_train['emotion']
+Y_train_encoded = ENCODER.fit_transform(Y_train_raw)
+
+print(f"X_train_combined shape: {X_train_combined.shape}")
+print(f"X_test_combined shape: {X_test_combined.shape}")
+
+
+# --- 2. MODEL IMPLEMENTATION (Training, Tuning, Evaluation) ---
+print("\n--- 2. Model Implementation: Training & Tuning ---")
+
+# 2.1 Internal Train-Validation Split
+X_TRAIN, X_VALIDATION, Y_TRAIN, Y_VALIDATION = train_test_split(
+    X_train_combined, 
+    Y_train_encoded, 
+    test_size=0.2, 
+    random_state=42, 
+    stratify=Y_train_encoded
+)
+
+# 2.2 Hyperparameter Tuning (GridSearchCV)
+param_grid = {'C': [0.1, 0.5, 1.0, 5.0]} 
+grid_search = GridSearchCV(
+    LinearSVC(max_iter=10000, dual=True, random_state=42), 
+    param_grid, 
+    scoring='f1_macro', 
+    cv=5, 
+    n_jobs=-1,
+    verbose=0
+)
+grid_search.fit(X_TRAIN, Y_TRAIN)
+best_model = grid_search.best_estimator_
+
+# 2.3 Model Evaluation on Validation Set
+Y_pred_validation = best_model.predict(X_VALIDATION)
+
+print(f"✅ Best Hyperparameter found: C={grid_search.best_params_['C']}")
+print("\n--- 3. Model Evaluation on Validation Set ---")
+print(f"F1 Score (Macro Avg): {f1_score(Y_VALIDATION, Y_pred_validation, average='macro'):.4f}")
+print("\nClassification Report:")
+print(classification_report(Y_VALIDATION, Y_pred_validation, target_names=ENCODER.classes_))
+
+
+# --- 4. PREDICTION VISUALIZATION (Predicting on Training Data) ---
+print("\n--- 4. Prediction Visualization on Full Training Set ---")
+
+# Predict using the best model on the WHOLE training set
+Y_train_pred_encoded = best_model.predict(X_train_combined)
+
+# Inverse transform to get readable emotion labels
+Y_train_pred_raw = ENCODER.inverse_transform(Y_train_pred_encoded)
+Y_train_true_raw = df_train['emotion']
+
+# Create a DataFrame for comparison
+df_comparison = pd.DataFrame({
+    'Text': df_train['text'],
+    'True_Emotion': Y_train_true_raw,
+    'Predicted_Emotion': Y_train_pred_raw
+})
+
+# Add a column to identify misclassified examples
+df_comparison['Is_Correct'] = df_comparison['True_Emotion'] == df_comparison['Predicted_Emotion']
+
+# --- Styling for Visualization ---
+def style_prediction(row):
+    if row['Is_Correct']:
+        return ['background-color: #d4edda; color: #155724'] * 3 # Green for correct
+    else:
+        return ['background-color: #f8d7da; color: #721c24'] * 3 # Red for incorrect
+
+# Display a sample of 25 posts, prioritizing 5 incorrect ones if possible
+incorrect_sample = df_comparison[~df_comparison['Is_Correct']].head(5)
+correct_sample = df_comparison[df_comparison['Is_Correct']].sample(n=min(20, len(df_comparison[df_comparison['Is_Correct']])), random_state=42)
+
+df_visualize = pd.concat([incorrect_sample, correct_sample]).sample(frac=1, random_state=1).head(25)
+
+print(f"Showing sample of {len(df_visualize)} posts (Mix of Correct and Incorrect Predictions):")
+
+styled_comparison = (
+    df_visualize[['Text', 'True_Emotion', 'Predicted_Emotion']]
+    .style
+    .apply(style_prediction, axis=1)
+    .set_table_styles([
+        dict(selector='th', props=[('background-color', '#343a40'), ('color', 'white'), ('font-weight', 'bold'), ('padding', '8px')]),
+        dict(selector='td', props=[('padding', '6px'), ('vertical-align', 'top'), ('max-width', '400px'), ('white-space', 'pre-wrap')]),
+        dict(selector='caption', props=[('font-size', '1.2em'), ('font-weight', 'bold')])
+    ])
+    .set_caption("👁️ Training Set Prediction Visualization (Red=Incorrect, Green=Correct)")
+    .hide(axis="index")
+)
+
+display(styled_comparison)
+
+
+# --- 5. FINAL PREDICTION ON UNSEEN TEST DATA (Submission) ---
+
+print("\n--- 5. Final Prediction on Unseen Test Data (Submission) ---")
+
+# Re-train the final model on ALL available training data
+final_model = LinearSVC(C=grid_search.best_params_['C'], max_iter=10000, dual=True, random_state=42)
+final_model.fit(X_train_combined, Y_train_encoded)
+
+# Predict on the X_test_combined matrix
+final_predictions_encoded = final_model.predict(X_test_combined)
+
+# Inverse Transform to get raw emotion names (strings)
+final_predictions_raw = ENCODER.inverse_transform(final_predictions_encoded)
+
+# Generate Submission File
+submission_df = pd.DataFrame({
+    'id': df_test['post_id'],
+    'emotion': final_predictions_raw 
+})
+
+submission_file_path = 'DM2025_Lab2_Submission_Word2Vec_BestSVM_Visualized.csv'
+submission_df.to_csv(submission_file_path, index=False)
+
+print(f"\n✅ Final Submission file created successfully: '{submission_file_path}'")
+print(f"Prediction Sample (Top 5):")
+print(submission_df.head())
